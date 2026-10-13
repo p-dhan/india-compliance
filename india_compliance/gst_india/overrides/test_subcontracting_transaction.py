@@ -777,7 +777,27 @@ class TestSubcontractingInwardOrder(IntegrationTestCase):
         )
 
     @staticmethod
-    def _expected_delivery_value(item):
+    def _service_value(item):
+        """Service charge for the delivered quantity of a finished-good row."""
+        fg = frappe.db.get_value(
+            "Subcontracting Inward Order Item",
+            item.scio_detail,
+            ["parent", "sales_order_item", "conversion_factor", "subcontracting_conversion_factor"],
+            as_dict=True,
+        )
+        service_rate = frappe.db.get_value(
+            "Subcontracting Inward Order Service Item",
+            {"parent": fg.parent, "sales_order_item": fg.sales_order_item},
+            "rate",
+        )
+        service_cost = (
+            flt(service_rate)
+            * (flt(fg.subcontracting_conversion_factor) or 1)
+            / (flt(fg.conversion_factor) or 1)
+        )
+        return service_cost * flt(item.transfer_qty)
+
+    def _expected_delivery_value(self, item):
         """Weighted-average actual customer-material consumption per FG unit delivered."""
         produced_qty = frappe.db.get_value(
             "Subcontracting Inward Order Item", item.scio_detail, "produced_qty"
@@ -788,7 +808,10 @@ class TestSubcontractingInwardOrder(IntegrationTestCase):
             fields=["rate", "consumed_qty"],
         )
         material_cost = sum(flt(row.rate) * flt(row.consumed_qty) for row in received_items)
-        return material_cost / flt(produced_qty) * flt(item.transfer_qty)
+        service_cost = self._service_value(item) / flt(item.transfer_qty)
+        return (
+            material_cost / flt(produced_qty) + service_cost
+        ) * flt(item.transfer_qty) - flt(item.amount)
 
     def test_subcontracting_delivery_taxable_value(self):
         delivery = make_subcontracting_inward_delivery(do_not_submit=True)
@@ -804,12 +827,12 @@ class TestSubcontractingInwardOrder(IntegrationTestCase):
             expected_additional = flt(self._expected_delivery_value(item), precision)
 
             self.assertEqual(flt(item.additional_taxable_value), expected_additional)
-            # taxable_value rolls the customer-material value into the SE amount
+            # taxable_value = customer material + service cost (SE amount is replaced)
             self.assertEqual(
                 flt(item.taxable_value),
                 flt(item.amount) + flt(item.additional_taxable_value),
             )
-            self.assertGreater(item.additional_taxable_value, 0)
+            self.assertGreater(item.taxable_value, 0)
             priced_rows += 1
 
         self.assertTrue(priced_rows, "No finished-good rows were priced")
@@ -929,7 +952,10 @@ class TestSubcontractingInwardOrder(IntegrationTestCase):
                 continue
             # BOM is 1:1 with no process loss, so consumed_qty == produced_qty
             # and the per-unit material value is the weighted average (16).
-            self.assertEqual(flt(item.additional_taxable_value), flt(16 * item.transfer_qty, precision))
+            self.assertEqual(
+                flt(item.taxable_value),
+                flt(16 * item.transfer_qty + self._service_value(item), precision),
+            )
             priced_rows += 1
 
         self.assertTrue(priced_rows, "No finished-good rows were priced")
@@ -962,10 +988,14 @@ class TestSubcontractingInwardOrder(IntegrationTestCase):
         )
 
         first_value = sum(
-            flt(item.additional_taxable_value) for item in first.items if item.get("scio_detail")
+            flt(item.taxable_value) - self._service_value(item)
+            for item in first.items
+            if item.get("scio_detail")
         )
         second_value = sum(
-            flt(item.additional_taxable_value) for item in second.items if item.get("scio_detail")
+            flt(item.taxable_value) - self._service_value(item)
+            for item in second.items
+            if item.get("scio_detail")
         )
 
         # The two partial deliveries together carry exactly the full consumed value.

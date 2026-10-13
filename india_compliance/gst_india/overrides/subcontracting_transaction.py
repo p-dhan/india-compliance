@@ -432,33 +432,45 @@ def set_subcontracting_inward_taxable_value(doc):
 
 
 def _set_subcontracting_delivery_additional_value(doc):
-    """Add the value of consumed customer materials to the delivered finished goods.
+    """Set the e-Waybill taxable value of delivered finished goods to
+    customer-provided material cost + service cost.
 
-    additional = SUM(order_rate * consumed_qty) / produced_qty * delivered transfer_qty.
-    Quantities are all in stock UOM (consumed_qty, produced_qty, transfer_qty), so
-    the value is consistent with the row amount. Left at 0 for secondary items,
-    no consumption, or no production yet.
+    material = SUM(order_rate * consumed_qty) / produced_qty * delivered transfer_qty
+    service  = service item rate * subcontracting_conversion_factor / conversion_factor
+               * delivered transfer_qty
+
+    The Stock Entry amount (own valuation of the finished good) is not part of the
+    value, so additional = material + service - amount and
+    taxable_value = amount + additional = material + service.
+    Quantities are in stock UOM (consumed_qty, produced_qty, transfer_qty). Left
+    untouched for secondary items and rows with no production yet.
     """
     scio_details = {item.scio_detail for item in doc.items if item.get("scio_detail")}
     if not scio_details:
         return
 
+    fg_rows = frappe.get_all(
+        "Subcontracting Inward Order Item",
+        filters={"name": ("in", list(scio_details))},
+        fields=[
+            "name",
+            "parent",
+            "produced_qty",
+            "conversion_factor",
+            "subcontracting_conversion_factor",
+            "sales_order_item",
+        ],
+    )
+    if not fg_rows:
+        return
+
+    fg_rows = {row.name: row for row in fg_rows}
+
     # Customer-provided received items for the finished goods being delivered.
     received_items = frappe.get_all(
         "Subcontracting Inward Order Received Item",
-        filters={"reference_name": ("in", list(scio_details)), "is_customer_provided_item": 1},
+        filters={"reference_name": ("in", list(fg_rows)), "is_customer_provided_item": 1},
         fields=["reference_name", "rate", "consumed_qty"],
-    )
-    if not received_items:
-        return
-
-    produced_qty = frappe._dict(
-        frappe.get_all(
-            "Subcontracting Inward Order Item",
-            filters={"name": ("in", list(scio_details))},
-            fields=["name", "produced_qty"],
-            as_list=True,
-        )
     )
 
     # Total consumed customer-material value per finished good, using the order rate.
@@ -467,21 +479,43 @@ def _set_subcontracting_delivery_additional_value(doc):
         cost = flt(row.rate) * flt(row.consumed_qty)
         fg_material_cost[row.reference_name] = fg_material_cost.get(row.reference_name, 0) + cost
 
+    service_rates = {
+        (row.parent, row.sales_order_item): flt(row.rate)
+        for row in frappe.get_all(
+            "Subcontracting Inward Order Service Item",
+            filters={"parent": ("in", list({row.parent for row in fg_rows.values()}))},
+            fields=["parent", "sales_order_item", "rate"],
+        )
+    }
+
     precision = doc.precision("additional_taxable_value", "items")
     rows_without_produced_qty = []
 
     for item in doc.items:
-        scio_detail = item.get("scio_detail")
-        material_cost = fg_material_cost.get(scio_detail)
-        if not material_cost:
+        fg_row = fg_rows.get(item.get("scio_detail"))
+        if not fg_row:
             continue
 
-        if not produced_qty.get(scio_detail):
-            rows_without_produced_qty.append(item.idx)
+        service_rate = service_rates.get((fg_row.parent, fg_row.sales_order_item), 0)
+        material_cost = fg_material_cost.get(fg_row.name, 0)
+        if not (service_rate or material_cost):
             continue
+
+        if material_cost and not flt(fg_row.produced_qty):
+            rows_without_produced_qty.append(item.idx)
+            material_per_unit = 0
+        else:
+            material_per_unit = material_cost / flt(fg_row.produced_qty) if material_cost else 0
+
+        service_per_unit = (
+            service_rate
+            * (flt(fg_row.subcontracting_conversion_factor) or 1)
+            / (flt(fg_row.conversion_factor) or 1)
+        )
 
         item.additional_taxable_value = flt(
-            material_cost / flt(produced_qty.get(scio_detail)) * flt(item.transfer_qty), precision
+            (material_per_unit + service_per_unit) * flt(item.transfer_qty) - flt(item.amount),
+            precision,
         )
 
     if rows_without_produced_qty:
